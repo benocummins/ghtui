@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/charmbracelet/bubbles/table"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/cli/go-gh/v2/pkg/api"
@@ -20,11 +21,50 @@ import (
 var (
 	titleStyle    = lipgloss.NewStyle().Bold(true).Padding(0, 1)
 	selectedStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("212")).Bold(true)
-	openStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("2"))
-	closedStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("1"))
 )
 
 var menuOptions = []string{"Projects", "Issues"}
+
+// -----------------------------------------------------------------------------
+// Bubble Tables
+// -----------------------------------------------------------------------------
+func buildColumns(headers []string, rows []table.Row) []table.Column {
+	widths := make([]int, len(headers))
+	for i, h := range headers {
+		widths[i] = len(h)
+	}
+	for _, row := range rows {
+		for i, cell := range row {
+			if len(cell) > widths[i] {
+				widths[i] = len(cell)
+			}
+		}
+	}
+
+	columns := make([]table.Column, len(headers))
+	for i, h := range headers {
+		columns[i] = table.Column{Title: h, Width: widths[i] + 2}
+	}
+	return columns
+}
+
+func buildProjectItemRows(items []ProjectItem) []table.Row {
+	rows := make([]table.Row, len(items))
+	for i, item := range items {
+		if item.Content.Typename == "DraftIssue" {
+			rows[i] = table.Row{"", "", "Draft", item.Content.Title, ""}
+			continue
+		}
+		rows[i] = table.Row{
+			fmt.Sprint(item.Content.Number),
+			item.Content.State,
+			item.Content.Typename,
+			item.Content.Title,
+			item.Content.Repository.NameWithOwner,
+		}
+	}
+	return rows
+}
 
 // -----------------------------------------------------------------------------
 // Data Structures
@@ -51,25 +91,28 @@ type Project struct {
 type ProjectItem struct {
 	ID      string `json:"id"`
 	Content struct {
-		Typename string `json:"__typename"`
-		Number   int    `json:"number"`
-		Title    string `json:"title"`
-		State    string `json:"state"`
-		URL      string `json:"url"`
+		Typename   string `json:"__typename"`
+		Number     int    `json:"number"`
+		Title      string `json:"title"`
+		State      string `json:"state"`
+		URL        string `json:"url"`
+		Repository struct {
+			NameWithOwner string `json:"nameWithOwner"`
+		} `json:"repository"`
 	} `json:"content"`
 }
 
 type model struct {
-	username     string
-	issues       []Issue
-	projects     []Project
-	projectItems []ProjectItem
+	username string
+	issues   []Issue
+	projects []Project
 
-	screen            screen
-	menuCursor        int
-	issueCursor       int
-	projectCursor     int
-	projectItemCursor int
+	screen     screen
+	menuCursor int
+
+	issueTable       table.Model
+	projectTable     table.Model
+	projectItemTable table.Model
 }
 
 // -----------------------------------------------------------------------------
@@ -118,51 +161,43 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			}
 		case issuesScreen:
-			switch msg.String() {
-			case "esc":
+			if msg.String() == "esc" {
 				m.screen = menuScreen
-			case "up", "k":
-				if m.issueCursor > 0 {
-					m.issueCursor--
-				}
-			case "down", "j":
-				if m.issueCursor < len(m.issues)-1 {
-					m.issueCursor++
-				}
+				return m, nil
 			}
+			var cmd tea.Cmd
+			m.issueTable, cmd = m.issueTable.Update(msg)
+			return m, cmd
 		case projectsScreen:
-			switch msg.String() {
-			case "esc":
+			if msg.String() == "esc" {
 				m.screen = menuScreen
-			case "up", "k":
-				if m.projectCursor > 0 {
-					m.projectCursor--
-				}
-			case "down", "j":
-				if m.projectCursor < len(m.projects)-1 {
-					m.projectCursor++
-				}
-			case "enter":
-				items, err := fetchProjectItems(m.projects[m.projectCursor].ID)
+				return m, nil
+			}
+			if msg.String() == "enter" {
+				items, err := fetchProjectItems(m.projects[m.projectTable.Cursor()].ID)
 				if err == nil {
-					m.projectItems = items
-					m.projectItemCursor = 0
+					rows := buildProjectItemRows(items)
+					m.projectItemTable = table.New(
+						table.WithColumns(buildColumns([]string{"#", "State", "Type", "Title", "Repo"}, rows)),
+						table.WithRows(rows),
+						table.WithFocused(true),
+						table.WithHeight(15),
+					)
 					m.screen = projectItemsScreen
+					return m, nil
 				}
 			}
+			var cmd tea.Cmd
+			m.projectTable, cmd = m.projectTable.Update(msg)
+			return m, cmd
 		case projectItemsScreen:
-			switch msg.String() {
-			case "esc":
+			if msg.String() == "esc" {
 				m.screen = projectsScreen
-			case "up", "k":
-				if m.projectItemCursor > 0 {
-					m.projectItemCursor--
-				}
-			case "down", "j":
-				if m.projectItemCursor < len(m.projectItems)-1 {
-					m.projectItemCursor++
-				}
+				return m, nil
 			}
+			var cmd tea.Cmd
+			m.projectItemTable, cmd = m.projectItemTable.Update(msg)
+			return m, cmd
 		}
 	}
 	return m, nil
@@ -200,72 +235,17 @@ func (m model) viewMenu() string {
 
 // --- Screens View Issues ---
 func (m model) viewIssues() string {
-	s := titleStyle.Render("Issues (esc to go back, q to quit)") + "\n\n"
-	for i, issue := range m.issues {
-		stateStyle := openStyle
-		if issue.State == "closed" {
-			stateStyle = closedStyle
-		}
-		line := fmt.Sprintf("#%d [%s] %s", issue.Number, stateStyle.Render(issue.State), issue.Title)
-
-		cursor := "  "
-		if m.issueCursor == i {
-			cursor = "> "
-			line = selectedStyle.Render(line)
-		}
-		s += cursor + line + "\n"
-	}
-	return s
+	return titleStyle.Render("Issues (esc to go back, q to quit)") + "\n\n" + m.issueTable.View()
 }
 
 // --- Screens View Projects ---
 func (m model) viewProjects() string {
-	s := titleStyle.Render("Projects (esc to go back, q to quit)") + "\n\n"
-	for i, project := range m.projects {
-		line := fmt.Sprintf("#%d %s", project.Number, project.Title)
-		if project.ShortDescription != "" {
-			line += " — " + project.ShortDescription
-		}
-
-		cursor := "  "
-		if m.projectCursor == i {
-			cursor = "> "
-			line = selectedStyle.Render(line)
-		}
-		s += cursor + line + "\n"
-	}
-	return s
+	return titleStyle.Render("Projects (esc to go back, q to quit)") + "\n\n" + m.projectTable.View()
 }
 
 // --- Screens View Project Items ---
 func (m model) viewProjectItems() string {
-	s := titleStyle.Render("Project Items (esc to go back, q to quit)") + "\n\n"
-	for i, projectItem := range m.projectItems {
-		if projectItem.Content.Typename == "DraftIssue" {
-			line := fmt.Sprintf("-- [DRAFT] %s %s", projectItem.Content.Typename, projectItem.Content.Title)
-
-			cursor := "  "
-			if m.projectItemCursor == i {
-				cursor = "> "
-				line = selectedStyle.Render(line)
-			}
-			s += cursor + line + "\n"
-		} else {
-			stateStyle := openStyle
-			if projectItem.Content.State == "closed" {
-				stateStyle = closedStyle
-			}
-			line := fmt.Sprintf("#%d [%s] %s %s", projectItem.Content.Number, stateStyle.Render(projectItem.Content.State), projectItem.Content.Typename, projectItem.Content.Title)
-
-			cursor := "  "
-			if m.projectItemCursor == i {
-				cursor = "> "
-				line = selectedStyle.Render(line)
-			}
-			s += cursor + line + "\n"
-		}
-	}
-	return s
+	return titleStyle.Render("Project Items (esc to go back, q to quit)") + "\n\n" + m.projectItemTable.View()
 }
 
 // -----------------------------------------------------------------------------
@@ -352,12 +332,18 @@ func fetchProjectItems(projectID string) ([]ProjectItem, error) {
 															title
 															state
 															url
+															repository {
+																nameWithOwner
+															}
 													}
 													... on PullRequest {
 															number
 															title
 															state
 															url
+															repository {
+																nameWithOwner
+															}
 													}
 													... on DraftIssue {
 															title
@@ -410,17 +396,41 @@ func main() {
 		os.Exit(1)
 	}
 
+	issueRows := make([]table.Row, len(issues))
+	for i, issue := range issues {
+		issueRows[i] = table.Row{fmt.Sprint(issue.Number), issue.State, issue.Title}
+	}
+	issueTable := table.New(
+		table.WithColumns(buildColumns([]string{"#", "State", "Title"}, issueRows)),
+		table.WithRows(issueRows),
+		table.WithFocused(true),
+		table.WithHeight(15),
+	)
+
 	projects, err := fetchProjects()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error fetching projects:", err)
 		os.Exit(1)
 	}
 
+	projectRows := make([]table.Row, len(projects))
+	for i, project := range projects {
+		projectRows[i] = table.Row{fmt.Sprint(project.Number), project.Title, project.ShortDescription}
+	}
+	projectTable := table.New(
+		table.WithColumns(buildColumns([]string{"#", "Title", "Short Description"}, projectRows)),
+		table.WithRows(projectRows),
+		table.WithFocused(true),
+		table.WithHeight(15),
+	)
+
 	m := model{
-		username: user.Login,
-		issues:   issues,
-		projects: projects,
-		screen:   menuScreen,
+		username:     user.Login,
+		issues:       issues,
+		issueTable:   issueTable,
+		projects:     projects,
+		projectTable: projectTable,
+		screen:       menuScreen,
 	}
 	p := tea.NewProgram(m)
 	if _, err := p.Run(); err != nil {
